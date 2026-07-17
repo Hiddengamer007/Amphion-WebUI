@@ -1,3 +1,5 @@
+from pyngrok import ngrok
+
 """
 Gradio WebUI for Vevo2 (Amphion), replicating:
 
@@ -16,6 +18,10 @@ Resource notes for weak hardware:
   * Lower "Flow-matching steps" (e.g. 16) to cut compute/time.
   * Enable chunking for long inputs to bound peak memory.
   * Use the "Unload model" button to free RAM/VRAM when not generating.
+  
+New features:
+  * Multithreaded chunked audio processing for faster FM inference on long files
+  * Dual GPU support (Kaggle 2x NVIDIA T4) with GPU selection in UI
 """
 
 import os
@@ -23,6 +29,8 @@ import sys
 import argparse
 import threading
 import tempfile
+from concurrent.futures import ThreadPoolExecutor, as_completed
+import queue
 
 # Make sure the Amphion repo root (this file's folder) is importable so that
 # `from models.svc.vevo2.vevo2_utils import ...` resolves, exactly like `python -m`.
@@ -50,20 +58,43 @@ PIPELINE = None
 PIPELINE_MODE = None
 LOCK = threading.Lock()
 
+# GPU configuration
+GPU_DEVICES = []
+GPU_PIPELINES = {}
+
 
 def _ckpt(*parts):
     return os.path.join(CKPT_DIR, *parts)
 
 
-def load_pipeline(device, mode, cpu_threads=0):
+def get_available_gpus():
+    """Detect available GPUs (supporting Kaggle 2x T4 setup)."""
+    if not torch.cuda.is_available():
+        return []
+    return [f"cuda:{i}" for i in range(torch.cuda.device_count())]
+
+
+def load_pipeline(device, mode, cpu_threads=0, use_multi_gpu=False):
     """Download (if needed) and build the Vevo2 inference pipeline.
 
     Mirrors load_inference_pipeline() in both infer_vevo2_fm.py and infer_vevo2_ar.py.
+    
+    Args:
+        device: Primary device string ("auto", "cpu", "cuda:0", "cuda:1", etc.)
+        mode: "FM only" or "AR+FM"
+        cpu_threads: Number of CPU threads (0 = auto)
+        use_multi_gpu: If True, load pipelines on ALL available GPUs for parallel chunk processing
     """
-    global PIPELINE, PIPELINE_MODE
+    global PIPELINE, PIPELINE_MODE, GPU_DEVICES, GPU_PIPELINES
 
+    # Detect GPU devices
+    available_gpus = get_available_gpus()
+    
     if device == "auto":
-        dev = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+        if available_gpus:
+            dev = torch.device(available_gpus[0])
+        else:
+            dev = torch.device("cpu")
     else:
         dev = torch.device(device)
 
@@ -84,44 +115,67 @@ def load_pipeline(device, mode, cpu_threads=0):
     vocoder_cfg_path = _ckpt("vocoder", "config.json")
     vocoder_ckpt_path = _ckpt("vocoder")
 
-    if mode == "AR+FM":
-        prosody_tokenizer_ckpt_path = _ckpt("tokenizer", "prosody_fvq512_6.25hz")
-        ar_cfg_path = _ckpt("contentstyle_modeling", "posttrained", "amphion_config.json")
-        ar_ckpt_path = _ckpt("contentstyle_modeling", "posttrained")
+    def _build_pipeline(device_str):
+        """Build a pipeline on a specific device."""
+        dev_obj = torch.device(device_str)
+        
+        if mode == "AR+FM":
+            prosody_tokenizer_ckpt_path = _ckpt("tokenizer", "prosody_fvq512_6.25hz")
+            ar_cfg_path = _ckpt("contentstyle_modeling", "posttrained", "amphion_config.json")
+            ar_ckpt_path = _ckpt("contentstyle_modeling", "posttrained")
 
-        PIPELINE = Vevo2InferencePipeline(
-            prosody_tokenizer_ckpt_path=prosody_tokenizer_ckpt_path,
-            content_style_tokenizer_ckpt_path=content_style_tokenizer_ckpt_path,
-            ar_cfg_path=ar_cfg_path,
-            ar_ckpt_path=ar_ckpt_path,
-            fmt_cfg_path=fmt_cfg_path,
-            fmt_ckpt_path=fmt_ckpt_path,
-            vocoder_cfg_path=vocoder_cfg_path,
-            vocoder_ckpt_path=vocoder_ckpt_path,
-            device=dev,
-        )
-    else:  # FM only (the `infer_vevo2_fm` command)
-        PIPELINE = Vevo2InferencePipeline(
-            content_style_tokenizer_ckpt_path=content_style_tokenizer_ckpt_path,
-            fmt_cfg_path=fmt_cfg_path,
-            fmt_ckpt_path=fmt_ckpt_path,
-            vocoder_cfg_path=vocoder_cfg_path,
-            vocoder_ckpt_path=vocoder_ckpt_path,
-            device=dev,
-        )
+            return Vevo2InferencePipeline(
+                prosody_tokenizer_ckpt_path=prosody_tokenizer_ckpt_path,
+                content_style_tokenizer_ckpt_path=content_style_tokenizer_ckpt_path,
+                ar_cfg_path=ar_cfg_path,
+                ar_ckpt_path=ar_ckpt_path,
+                fmt_cfg_path=fmt_cfg_path,
+                fmt_ckpt_path=fmt_ckpt_path,
+                vocoder_cfg_path=vocoder_cfg_path,
+                vocoder_ckpt_path=vocoder_ckpt_path,
+                device=dev_obj,
+            )
+        else:  # FM only
+            return Vevo2InferencePipeline(
+                content_style_tokenizer_ckpt_path=content_style_tokenizer_ckpt_path,
+                fmt_cfg_path=fmt_cfg_path,
+                fmt_ckpt_path=fmt_ckpt_path,
+                vocoder_cfg_path=vocoder_cfg_path,
+                vocoder_ckpt_path=vocoder_ckpt_path,
+                device=dev_obj,
+            )
 
+    # Load primary pipeline
+    PIPELINE = _build_pipeline(str(dev))
     PIPELINE_MODE = mode
+    
+    # Load on all GPUs if multi-GPU is enabled
+    GPU_DEVICES = []
+    GPU_PIPELINES = {}
+    
+    if use_multi_gpu and len(available_gpus) > 1:
+        for gpu_id in available_gpus:
+            try:
+                GPU_PIPELINES[gpu_id] = _build_pipeline(gpu_id)
+                GPU_DEVICES.append(gpu_id)
+            except Exception as e:
+                print(f"Warning: Failed to load pipeline on {gpu_id}: {e}")
+        
+        if GPU_DEVICES:
+            return f"Loaded '{mode}' pipeline on {len(GPU_DEVICES)} GPUs: {', '.join(GPU_DEVICES)}."
+    
     return f"Loaded '{mode}' pipeline on {dev}."
 
 
 def unload_pipeline():
-    global PIPELINE, PIPELINE_MODE
+    global PIPELINE, PIPELINE_MODE, GPU_PIPELINES, GPU_DEVICES
     PIPELINE = None
     PIPELINE_MODE = None
+    GPU_PIPELINES = {}
+    GPU_DEVICES = []
     if torch.cuda.is_available():
         torch.cuda.empty_cache()
     import gc
-
     gc.collect()
     return "Pipeline unloaded; memory released."
 
@@ -150,8 +204,31 @@ def _save(tensor_audio, out_name):
     return out_path
 
 
-def run_fm(source, reference, steps, pitch_shift, chunk, chunk_dur, out_name, progress=gr.Progress()):
-    """Replicates vevo2_fm(): source = content/prosody, reference = target timbre."""
+def _process_single_chunk(args):
+    """Process a single audio chunk (called by ThreadPoolExecutor)."""
+    seg_path, reference, pitch_shift, steps, gpu_id = args
+    
+    # Use GPU-specific pipeline if available
+    if gpu_id and gpu_id in GPU_PIPELINES:
+        pipeline = GPU_PIPELINES[gpu_id]
+    else:
+        pipeline = PIPELINE
+    
+    audio = pipeline.inference_fm(
+        src_wav_path=seg_path,
+        timbre_ref_wav_path=reference,
+        use_pitch_shift=bool(pitch_shift),
+        flow_matching_steps=steps,
+    )
+    return audio.squeeze(0).numpy()
+
+
+def run_fm(source, reference, steps, pitch_shift, chunk, chunk_dur, out_name, 
+           use_multi_gpu=False, progress=gr.Progress()):
+    """Replicates vevo2_fm(): source = content/prosody, reference = target timbre.
+    
+    Now with multithreaded chunk processing and multi-GPU support.
+    """
     if PIPELINE is None:
         return None, "Load the model first (use the Model tab)."
     if source is None or reference is None:
@@ -175,21 +252,53 @@ def run_fm(source, reference, steps, pitch_shift, chunk, chunk_dur, out_name, pr
                     parts = []
                     tmp = tempfile.mkdtemp()
                     n = len(bounds)
+                    
+                    # Prepare chunk files
+                    chunk_files = []
                     for i, start in enumerate(bounds):
                         seg = y[start : start + chunk_samples]
                         seg_path = os.path.join(tmp, f"seg_{i}.wav")
                         torchaudio.save(seg_path, torch.from_numpy(seg).unsqueeze(0), 24000)
-                        progress((i + 0.5) / n, desc=f"FM chunk {i+1}/{n}")
-                        a = PIPELINE.inference_fm(
-                            src_wav_path=seg_path,
-                            timbre_ref_wav_path=reference,
-                            use_pitch_shift=bool(pitch_shift),
-                            flow_matching_steps=steps,
-                        )
-                        parts.append(a.squeeze(0).numpy())
-                    audio = torch.from_numpy(_crossfade_concat(parts, 24000))
+                        chunk_files.append(seg_path)
+                    
+                    # Determine GPU assignment for each chunk
+                    gpu_pool = GPU_DEVICES if (use_multi_gpu and GPU_DEVICES) else [None]
+                    
+                    # Build task list with GPU round-robin assignment
+                    tasks = []
+                    for i, seg_path in enumerate(chunk_files):
+                        gpu_id = gpu_pool[i % len(gpu_pool)]
+                        tasks.append((seg_path, reference, pitch_shift, steps, gpu_id))
+                    
+                    # Process chunks in parallel using ThreadPoolExecutor
+                    progress(0.1, desc=f"Processing {n} chunks on {len(gpu_pool)} GPU(s)...")
+                    
+                    results = [None] * n
+                    completed = 0
+                    
+                    with ThreadPoolExecutor(max_workers=len(gpu_pool)) as executor:
+                        future_to_idx = {
+                            executor.submit(_process_single_chunk, task): i 
+                            for i, task in enumerate(tasks)
+                        }
+                        
+                        for future in as_completed(future_to_idx):
+                            idx = future_to_idx[future]
+                            try:
+                                results[idx] = future.result()
+                                completed += 1
+                                progress(
+                                    0.1 + 0.8 * (completed / n), 
+                                    desc=f"FM chunk {completed}/{n} done"
+                                )
+                            except Exception as e:
+                                return None, f"Error processing chunk {idx}: {e}"
+                    
+                    # Concatenate results in order
+                    audio = torch.from_numpy(_crossfade_concat(results, 24000))
                     out_path = _save(audio.unsqueeze(0), out_name)
-                    return out_path, f"Done (chunked, {n} segments)."
+                    gpu_info = f" ({len(gpu_pool)} GPU(s) parallel)" if len(gpu_pool) > 1 else ""
+                    return out_path, f"Done (chunked, {n} segments{gpu_info})."
                 # falls through to normal path if shorter than one chunk
 
             progress(0.1, desc="Running FM inference")
@@ -273,14 +382,21 @@ def run_ar(task, target_text, raw_audio, raw_text, style_audio, style_text,
 def build_ui():
     with gr.Blocks(title="Vevo2 WebUI") as demo:
         gr.Markdown(
-            "# Vevo2 WebUI (Amphion)\n"
-            "Mirror of `python -m models.svc.vevo2.infer_vevo2_fm` with extra AR tasks.\n"
-            "**Tip for weak hardware:** device = `cpu`, lower flow-matching steps, enable chunking."
+            "# Vevo2 WebUI (Amphion)\\n"
+            "Mirror of `python -m models.svc.vevo2.infer_vevo2_fm` with extra AR tasks.\\n"
+            "**Tip for weak hardware:** device = `cpu`, lower flow-matching steps, enable chunking.\\n"
+            "**New:** Multithreaded chunk processing + Dual GPU support (Kaggle 2x T4)."
         )
 
         with gr.Tab("Model"):
+            # Auto-detect available GPUs for dropdown
+            gpu_choices = ["auto", "cpu", "mps"]
+            if torch.cuda.is_available():
+                for i in range(torch.cuda.device_count()):
+                    gpu_choices.append(f"cuda:{i}")
+            
             device = gr.Dropdown(
-                ["auto", "cpu", "cuda", "cuda:0", "mps"],
+                gpu_choices,
                 value="auto",
                 label="Device",
             )
@@ -290,13 +406,28 @@ def build_ui():
                 label="Pipeline mode (FM only = the `infer_vevo2_fm` command)",
             )
             cpu_threads = gr.Number(value=0, precision=0, label="CPU threads (0 = auto)")
+            
+            # Multi-GPU support toggle
+            multi_gpu = gr.Checkbox(
+                value=False, 
+                label="Use ALL GPUs (Kaggle 2x T4)",
+                info="Load pipeline on all available GPUs for parallel chunk processing"
+            )
+            
+            # GPU info display
+            gpu_info = gr.Markdown(
+                f"**Detected GPUs:** {torch.cuda.device_count()} available" 
+                if torch.cuda.is_available() 
+                else "**No CUDA GPUs detected**"
+            )
+            
             load_btn = gr.Button("Load / Download model", variant="primary")
             unload_btn = gr.Button("Unload model (free memory)")
             model_status = gr.Textbox(label="Status", interactive=False)
 
             load_btn.click(
-                lambda d, m, t: load_pipeline(d, m, int(t or 0)),
-                [device, mode, cpu_threads],
+                lambda d, m, t, mg: load_pipeline(d, m, int(t or 0), mg),
+                [device, mode, cpu_threads, multi_gpu],
                 model_status,
             )
             unload_btn.click(unload_pipeline, [], model_status)
@@ -304,7 +435,8 @@ def build_ui():
         with gr.Tab("Voice / Singing Conversion (FM)"):
             gr.Markdown(
                 "Source = content & prosody (speech, singing, or even an instrument). "
-                "Reference = target voice/timbre. This is exactly what `infer_vevo2_fm` does."
+                "Reference = target voice/timbre. This is exactly what `infer_vevo2_fm` does.\\n"
+                "**Chunked mode now uses multithreading** — chunks are processed in parallel across GPUs."
             )
             with gr.Row():
                 fm_source = gr.Audio(label="Source (content/prosody)", type="filepath")
@@ -315,13 +447,18 @@ def build_ui():
             with gr.Row():
                 fm_chunk = gr.Checkbox(value=False, label="Chunk long audio")
                 fm_chunk_dur = gr.Number(value=15, label="Chunk duration (s)")
+                fm_multi_gpu = gr.Checkbox(
+                    value=False, 
+                    label="Use Multi-GPU for chunks",
+                    info="Process chunks in parallel across all loaded GPUs"
+                )
                 fm_out = gr.Textbox(value="svc", label="Output file name")
             fm_run = gr.Button("Convert", variant="primary")
             fm_audio = gr.Audio(label="Output", type="filepath")
             fm_status = gr.Textbox(label="Status", interactive=False)
             fm_run.click(
                 run_fm,
-                [fm_source, fm_ref, fm_steps, fm_pitch, fm_chunk, fm_chunk_dur, fm_out],
+                [fm_source, fm_ref, fm_steps, fm_pitch, fm_chunk, fm_chunk_dur, fm_out, fm_multi_gpu],
                 [fm_audio, fm_status],
             )
 
@@ -364,15 +501,20 @@ def main():
     parser.add_argument("--share", action="store_true", help="Create a Gradio public share link")
     parser.add_argument("--port", type=int, default=7860)
     parser.add_argument("--server-name", default="127.0.0.1")
+    parser.add_argument("--multi-gpu", action="store_true", help="Load on all available GPUs")
     args = parser.parse_args()
 
-    demo = build_ui()
-    demo.launch(
-        server_name=args.server_name,
-        server_port=args.port,
-        share=args.share,
-    )
+    # Pre-load if requested
+    if args.multi_gpu:
+        print("Pre-loading pipeline on all GPUs...")
+        load_pipeline(args.device, args.mode, use_multi_gpu=True)
 
+    demo = build_ui()
+    
+    # NGROK
+    public_url = ngrok.connect(7860)
+    print(f" * Public URL: {public_url}")
+    demo.launch(server_name=args.server_name, server_port=args.port, share=args.share, inbrowser=True)
 
 if __name__ == "__main__":
     main()
