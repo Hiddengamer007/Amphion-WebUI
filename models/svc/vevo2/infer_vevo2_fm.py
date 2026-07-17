@@ -55,9 +55,11 @@ if __name__ == "__main__":
 
     output_dir = "./models/svc/vevo2/output"
     os.makedirs(output_dir, exist_ok=True)
-
-    content_wav_path = "./models/svc/vevosing/wav/jaychou.wav"
-    reference_wav_path = "./models/svc/vevosing/wav/adele.wav"
+    
+    #content_wav_path = "./models/svc/vevosing/wav/jaychou.wav"
+    content_wav_path = input("Vocal File to be Converted: ")
+    #reference_wav_path = "./models/svc/vevosing/wav/adele.wav"
+    reference_wav_path = input("Refernce Voice Path: ")
     output_path = os.path.join(output_dir, "svc.wav")
 
     vevo2_fm(content_wav_path, reference_wav_path, output_path)
