@@ -51,15 +51,31 @@ def load_inference_pipeline():
 
 
 if __name__ == "__main__":
+    parser = argparse.ArgumentParser(description="Run Vevo2 SVC voice conversion.")
+    
+    parser.add_argument(
+        "--content", "-c", 
+        required=True, 
+        help="Path to the vocal file to be converted"
+    )
+    parser.add_argument(
+        "--reference", "-r", 
+        required=True, 
+        help="Path to the reference voice file"
+    )
+    parser.add_argument(
+        "--output_dir", "-o", 
+        default="./models/svc/vevo2/output", 
+        help="Directory where the output will be saved (default: ./models/svc/vevo2/output)"
+    )
+
+    args = parser.parse_args()
+
     inference_pipeline = load_inference_pipeline()
 
-    output_dir = "./models/svc/vevo2/output"
-    os.makedirs(output_dir, exist_ok=True)
-    
-    #content_wav_path = "./models/svc/vevosing/wav/jaychou.wav"
-    content_wav_path = input("Vocal File to be Converted: ")
-    #reference_wav_path = "./models/svc/vevosing/wav/adele.wav"
-    reference_wav_path = input("Refernce Voice Path: ")
-    output_path = os.path.join(output_dir, "svc.wav")
+    os.makedirs(args.output_dir, exist_ok=True)
+    output_path = os.path.join(args.output_dir, "svc.wav")
+
+    vevo2_fm(args.content, args.reference, output_path)
 
     vevo2_fm(content_wav_path, reference_wav_path, output_path)
