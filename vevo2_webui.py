@@ -382,9 +382,9 @@ def run_ar(task, target_text, raw_audio, raw_text, style_audio, style_text,
 def build_ui():
     with gr.Blocks(title="Vevo2 WebUI") as demo:
         gr.Markdown(
-            "# Vevo2 WebUI (Amphion)\\n"
-            "Mirror of `python -m models.svc.vevo2.infer_vevo2_fm` with extra AR tasks.\\n"
-            "**Tip for weak hardware:** device = `cpu`, lower flow-matching steps, enable chunking.\\n"
+            "# Vevo2 WebUI (Amphion)\n"
+            "Mirror of `python -m models.svc.vevo2.infer_vevo2_fm` with extra AR tasks.\n"
+            "**Tip for weak hardware:** device = `cpu`, lower flow-matching steps, enable chunking.\n"
             "**New:** Multithreaded chunk processing + Dual GPU support (Kaggle 2x T4)."
         )
 
@@ -435,7 +435,7 @@ def build_ui():
         with gr.Tab("Voice / Singing Conversion (FM)"):
             gr.Markdown(
                 "Source = content & prosody (speech, singing, or even an instrument). "
-                "Reference = target voice/timbre. This is exactly what `infer_vevo2_fm` does.\\n"
+                "Reference = target voice/timbre. This is exactly what `infer_vevo2_fm` does.\n"
                 "**Chunked mode now uses multithreading** — chunks are processed in parallel across GPUs."
             )
             with gr.Row():
