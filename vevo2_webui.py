@@ -512,9 +512,13 @@ def main():
     demo = build_ui()
     
     # NGROK
-    public_url = ngrok.connect(7860)
-    print(f" * Public URL: {public_url}")
-    demo.launch(server_name=args.server_name, server_port=args.port, share=args.share, inbrowser=True)
-
+    #public_url = ngrok.connect(7860)
+    #print(f" * Public URL: {public_url}")
+    #demo.launch(server_name=args.server_name, server_port=args.port, share=args.share, inbrowser=True)
+    demo.launch(
+        server_name=args.server_name,
+        server_port=args.port,
+        share=args.share,
+    )
 if __name__ == "__main__":
     main()
