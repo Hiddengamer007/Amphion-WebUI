@@ -1,0 +1,30 @@
+# Dependencies for the Vevo2 Gradio WebUI (Amphion).
+# Install from the Amphion repo root:  pip install -r vevo2_webui_requirements.txt
+#
+# Notes for Windows / weak hardware:
+#  * torch / torchaudio: pick builds matching your Python & CUDA (CPU wheels are fine).
+#  * pyworld often needs:  conda install -c conda-forge pyworld   (pip may fail to build on Windows)
+#  * openai-whisper needs ffmpeg on PATH.
+#  * transformers is required (LlamaModel for the FM transformer + Qwen2.5-0.5B for AR).
+
+torch
+torchaudio
+gradio
+transformers
+librosa
+soundfile
+numpy
+scipy
+einops
+accelerate
+safetensors
+pyyaml
+torchvision
+IPython
+openai-whisper
+torchcrepe
+praat-parselmouth
+pyworld
+tqdm
+humanfriendly
+scikit-learn
